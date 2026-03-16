@@ -20,7 +20,7 @@ class RotaryEmbedding(StateLessOP):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim
         inv_freq = 1.0 / (base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         if post_process is not None:
             inv_freq = post_process(inv_freq)
