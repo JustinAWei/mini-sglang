@@ -1,6 +1,8 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, List
+
 from transformers import PretrainedConfig
 
 
@@ -32,13 +34,43 @@ class ModelConfig:
     norm_topk_prob: bool
     model_type: str
     architectures: list[str]
+    # Qwen3.5 hybrid GDN/attention fields
+    full_attention_interval: int = 0  # 0 = all layers are standard attention
+    linear_num_key_heads: int = 0
+    linear_num_value_heads: int = 0
+    linear_key_head_dim: int = 0
+    linear_value_head_dim: int = 0
+    linear_conv_kernel_dim: int = 4
 
     @property
     def is_moe(self) -> bool:
         return "moe" in self.model_type
 
+    @property
+    def is_hybrid(self) -> bool:
+        return self.full_attention_interval > 0
+
+    @property
+    def layers_block_type(self) -> List[str]:
+        if self.full_attention_interval <= 0:
+            return ["attention"] * self.num_layers
+        result = []
+        for i in range(self.num_layers):
+            if (i + 1) % self.full_attention_interval == 0:
+                result.append("attention")
+            else:
+                result.append("linear_attention")
+        return result
+
+    @property
+    def num_kv_layers(self) -> int:
+        """Number of layers that use KV cache (attention layers only)."""
+        return sum(1 for t in self.layers_block_type if t == "attention")
+
     @classmethod
     def from_hf(cls, config: PretrainedConfig) -> ModelConfig:
+        # For VLM models (e.g. Qwen3.5), extract text_config and propagate
+        # top-level attrs that may not be on the nested config.
         if hasattr(config, "text_config") and config.text_config is not None:
             top = config
             config = config.text_config
@@ -56,9 +88,33 @@ class ModelConfig:
         norm_topk_prob = getattr(config, "norm_topk_prob", False)
         architectures = getattr(config, "architectures", ["LlamaForCausalLM"])
 
-        # Llama/Qwen: rope_theta is a direct attr; Mistral: it's inside rope_scaling dict
+        # Partial rotary support (Qwen3.5 uses partial_rotary_factor=0.25)
+        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1.0)
+        rotary_dim = int(head_dim * partial_rotary_factor)
+
+        # Llama/Qwen: rope_theta is a direct attr; Mistral: inside rope_scaling;
+        # transformers 5.x: inside rope_parameters
         rope_scaling = getattr(config, "rope_scaling", None)
-        rope_theta = getattr(config, "rope_theta", None) or rope_scaling["rope_theta"]
+        rope_theta = getattr(config, "rope_theta", None)
+        if rope_theta is None:
+            rope_params = getattr(config, "rope_parameters", rope_scaling)
+            if isinstance(rope_params, dict):
+                rope_theta = rope_params.get("rope_theta", 10000.0)
+            else:
+                rope_theta = 10000.0
+        # Skip multimodal RoPE scaling (mrope_sections)
+        if isinstance(rope_scaling, dict) and (
+            "mrope_sections" in rope_scaling or "mrope_section" in rope_scaling
+        ):
+            rope_scaling = None
+
+        # Qwen3.5 hybrid GDN/attention config
+        full_attention_interval = getattr(config, "full_attention_interval", 0)
+        linear_num_key_heads = getattr(config, "linear_num_key_heads", 0)
+        linear_num_value_heads = getattr(config, "linear_num_value_heads", 0)
+        linear_key_head_dim = getattr(config, "linear_key_head_dim", 0)
+        linear_value_head_dim = getattr(config, "linear_value_head_dim", 0)
+        linear_conv_kernel_dim = getattr(config, "linear_conv_kernel_dim", 4)
 
         return cls(
             num_layers=config.num_hidden_layers,
@@ -73,7 +129,7 @@ class ModelConfig:
             tie_word_embeddings=tie_word_embeddings,
             rotary_config=RotaryConfig(
                 head_dim=head_dim,
-                rotary_dim=head_dim,
+                rotary_dim=rotary_dim,
                 max_position=config.max_position_embeddings,
                 base=rope_theta,
                 scaling=rope_scaling,
@@ -84,4 +140,10 @@ class ModelConfig:
             norm_topk_prob=norm_topk_prob,
             model_type=model_type,
             architectures=architectures,
+            full_attention_interval=full_attention_interval,
+            linear_num_key_heads=linear_num_key_heads,
+            linear_num_value_heads=linear_num_value_heads,
+            linear_key_head_dim=linear_key_head_dim,
+            linear_value_head_dim=linear_value_head_dim,
+            linear_conv_kernel_dim=linear_conv_kernel_dim,
         )

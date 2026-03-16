@@ -51,6 +51,12 @@ class Engine:
             self.model = create_model(config.model_config)
         self.model.load_state_dict(self._load_weight_state_dict(config))
 
+        # ======================= GDN state allocation (for hybrid models) ========================
+        self._gdn_state_memory = 0
+        if hasattr(self.model, "allocate_gdn_states"):
+            self._gdn_state_memory = self._estimate_gdn_memory(config)
+            logger.info_rank0(f"Estimated GDN state memory: {mem_GB(self._gdn_state_memory)}")
+
         # ======================= KV cache initialization ========================
         self.num_pages = self._determine_num_pages(init_free_memory, config)
         num_tokens = self.num_pages * config.page_size
@@ -71,6 +77,14 @@ class Engine:
             dtype=torch.int32,
             device=self.device,
         )
+
+        # Allocate GDN states after KV cache
+        if hasattr(self.model, "allocate_gdn_states"):
+            self.model.allocate_gdn_states(
+                max_batch_size=config.max_running_req + 1,
+                device=self.device,
+                dtype=self.dtype,
+            )
 
         # ======================= Attention & MoE backend initialization ========================
         self.ctx.attn_backend = self.attn_backend = create_attention_backend(
@@ -96,12 +110,19 @@ class Engine:
             cache_handle=None,  # type: ignore
         )
         self.page_table[self.dummy_req.table_idx].fill_(num_tokens)  # point to dummy page
+
+        # Disable CUDA graphs for hybrid models (GDN state indexing is incompatible)
+        cuda_graph_bs = config.cuda_graph_bs
+        if config.model_config.is_hybrid:
+            cuda_graph_bs = []
+            logger.info_rank0("CUDA graphs disabled for hybrid GDN/attention model")
+
         self.graph_runner = GraphRunner(
             stream=self.stream,
             device=self.device,
             model=self.model,
             attn_backend=self.attn_backend,
-            cuda_graph_bs=config.cuda_graph_bs,
+            cuda_graph_bs=cuda_graph_bs,
             cuda_graph_max_bs=config.cuda_graph_max_bs,
             free_memory=init_free_memory,
             max_seq_len=aligned_max_seq_len,
@@ -145,6 +166,28 @@ class Engine:
         else:
             return {k: v.to(self.dtype) for k, v in load_weight(config.model_path, self.device)}
 
+    def _estimate_gdn_memory(self, config: EngineConfig) -> int:
+        """Estimate memory needed for GDN recurrent + conv states."""
+        mc = config.model_config
+        num_gdn_layers = sum(1 for t in mc.layers_block_type if t != "attention")
+        if num_gdn_layers == 0:
+            return 0
+        num_slots = config.max_running_req + 1
+        recurrent = (
+            num_gdn_layers * mc.linear_num_value_heads
+            * mc.linear_key_head_dim * mc.linear_value_head_dim
+            * self.dtype.itemsize * num_slots
+        )
+        qkv_dim = (
+            mc.linear_num_key_heads * mc.linear_key_head_dim * 2
+            + mc.linear_num_value_heads * mc.linear_value_head_dim
+        )
+        conv = (
+            num_gdn_layers * qkv_dim * mc.linear_conv_kernel_dim
+            * self.dtype.itemsize * num_slots
+        )
+        return recurrent + conv
+
     def _determine_num_pages(self, old_free_memory: int, config: EngineConfig) -> int:
         new_free_memory = self._sync_get_memory()[1]
         cache_per_page = (
@@ -159,6 +202,8 @@ class Engine:
         if num_pages is None:
             model_memory = old_free_memory - new_free_memory
             available_memory = int(config.memory_ratio * old_free_memory) - model_memory
+            # Subtract GDN state memory for hybrid models
+            available_memory -= self._gdn_state_memory
             num_pages = available_memory // cache_per_page
 
         assert num_pages > 1, "Not enough memory for KV cache, try reducing --num-pages"
