@@ -30,6 +30,9 @@ _SLOT_NAMES = {
 }
 _EXPERT_PATTERN = re.compile(r"^(?P<prefix>.+\.experts)\.(?P<idx>\d+)\.(?P<name>.+)$")
 
+# Checkpoint keys to skip (not needed by any model)
+_SKIP_PATTERNS = ["rotary_emb.", "mtp.", "attn_output_gate"]
+
 
 def _shard_tensor(key: str, value: torch.Tensor, r: int, n: int, num_kv_heads: int):
     """Extract rank r's shard from a single tensor. Returns a contiguous copy."""
@@ -72,6 +75,17 @@ def _get_expert_stack_info(key: str) -> tuple[str, int] | None:
     return f"{match.group('prefix')}.{packed_name}", int(match.group("idx"))
 
 
+def _is_qwen35_rmsnorm(name: str) -> bool:
+    """Check if a weight key is a Qwen3.5 RMSNorm that uses (1 + weight) formula.
+    Excludes the GDN gated norm (linear_attn.norm) which uses weight directly."""
+    return (
+        name.endswith("_layernorm.weight")
+        or name == "model.norm.weight"
+        or name.endswith("q_norm.weight")
+        or name.endswith("k_norm.weight")
+    )
+
+
 def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, torch.Tensor]]:
     """Streaming weight loader. Yields (name, tensor) pairs already sharded, merged,
     and on device. Peak CPU memory: one full tensor + a small merge buffer."""
@@ -83,6 +97,9 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
     files = [f for f in files if not f.endswith("consolidated.safetensors")] or files
     tp_info = get_tp_info()
 
+    # Qwen3.5 uses (1 + weight) in its RMSNorm; pre-add 1 so standard rmsnorm works.
+    adjust_norm = config.is_hybrid
+
     # Buffer for merge groups: merged_key -> {slot: tensor}
     merge_buf: Dict[str, Dict[str, torch.Tensor]] = {}
     expert_buf: Dict[str, Dict[int, torch.Tensor]] = {}
@@ -91,6 +108,8 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
             for name in f.keys():
                 # Strip multimodal wrapper prefix, skip vision/projector weights
                 if name.startswith(("vision_tower.", "multi_modal_projector.")):
+                    continue
+                if any(p in name for p in _SKIP_PATTERNS):
                     continue
                 raw = f.get_tensor(name)
                 name = name.removeprefix("language_model.")
@@ -107,6 +126,10 @@ def load_weight(model_path: str, device: torch.device) -> Iterator[Tuple[str, to
                     parts = [merge_buf[merged_key][s] for s in all_slots]
                     del merge_buf[merged_key]
                     out = (merged_key, torch.cat(parts, dim=0))
+
+                # Qwen3.5 RMSNorm (1 + weight) adjustment
+                if adjust_norm and _is_qwen35_rmsnorm(out[0]):
+                    out = (out[0], out[1] + 1.0)
 
                 if config.is_moe and (expert_info := _get_expert_stack_info(out[0])) is not None:
                     packed_key, expert_idx = expert_info
